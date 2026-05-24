@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="it" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=800, height=480, user-scalable=no, initial-scale=1">
+  <title>Claude Monitor</title>
+  <style>
+    /* ── Reset & base ─────────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { width: 800px; height: 480px; overflow: hidden; font-family: system-ui, sans-serif; }
+
+    /* ── Themes ────────────────────────────────────────────────────────────── */
+    [data-theme="dark"] {
+      --bg: #0D1B2A; --surface: #142230; --border: #1E3450;
+      --text: #E8F4FD; --muted: #7A9CC0; --header-bg: #0A1520;
+    }
+    [data-theme="blue"] {
+      --bg: #050E1A; --surface: #0D1E30; --border: #163050;
+      --text: #D8EEFF; --muted: #6A9AC0; --header-bg: #040B14;
+    }
+    [data-theme="purple"] {
+      --bg: #120B20; --surface: #1E1030; --border: #2E1850;
+      --text: #EBD8FF; --muted: #9A78C0; --header-bg: #0E0818;
+    }
+    /* Accent colors are theme-independent */
+    :root {
+      --cyan: #00C8FF; --green: #00E87A; --amber: #FFA040;
+      --red: #FF4444; --gold: #FFD700; --pink: #FF5FBF;
+    }
+
+    body { background: var(--bg); color: var(--text); }
+
+    /* ── Layout ────────────────────────────────────────────────────────────── */
+    #header {
+      position: fixed; top: 0; left: 0; width: 800px; height: 50px;
+      background: var(--header-bg); border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 16px; z-index: 100;
+    }
+    #main {
+      position: fixed; top: 50px; left: 0; width: 800px; height: 370px; overflow: hidden;
+    }
+    #nav {
+      position: fixed; bottom: 0; left: 0; width: 800px; height: 60px;
+      background: var(--header-bg); border-top: 1px solid var(--border);
+      display: flex;
+    }
+
+    /* ── Header ────────────────────────────────────────────────────────────── */
+    .header-left { display: flex; align-items: center; gap: 8px; }
+    .pulse-dot {
+      width: 8px; height: 8px; border-radius: 50%; background: var(--cyan);
+      animation: pulse 2s ease-in-out infinite;
+    }
+    @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:.3;} }
+    .app-title { font-size: 15px; font-weight: 700; letter-spacing: 2px; color: var(--cyan); }
+    .header-right { display: flex; gap: 16px; align-items: center; }
+    #date { font-size: 13px; color: var(--muted); }
+    #clock { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--text); }
+
+    /* ── Pages ─────────────────────────────────────────────────────────────── */
+    .page { position: absolute; top: 0; left: 0; width: 800px; height: 370px;
+            display: none; padding: 0 20px; }
+    .page.active { display: block; }
+
+    /* ── Page: NOW ──────────────────────────────────────────────────────────── */
+    #page-now {
+      display: none;
+      flex-direction: row;
+      gap: 0;
+    }
+    #page-now.active { display: flex; }
+
+    /* Left column: account status */
+    .now-left {
+      width: 380px; min-width: 380px;
+      padding: 16px 16px 16px 0;
+      display: flex; flex-direction: column; justify-content: center;
+    }
+    .section-label {
+      font-size: 11px; font-weight: 700; letter-spacing: 2px;
+      color: var(--muted); margin-bottom: 6px;
+    }
+    .big-number {
+      font-size: 100px; font-weight: 800; line-height: 1;
+      color: var(--green); font-variant-numeric: tabular-nums;
+      margin-bottom: 8px;
+    }
+    .progress-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+    .progress-bar {
+      flex: 1; height: 14px; background: var(--border);
+      border-radius: 7px; overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%; width: 0%; background: var(--green);
+      border-radius: 7px; transition: width .6s ease, background .4s ease;
+    }
+    .pct-badge {
+      font-size: 13px; font-weight: 700; color: var(--muted);
+      min-width: 38px; text-align: right;
+    }
+    .account-meta {
+      display: flex; justify-content: space-between; align-items: center;
+      font-size: 13px; color: var(--muted);
+    }
+    #countdown { font-size: 14px; font-weight: 600; color: var(--amber); }
+    .no-data-msg { font-size: 14px; color: var(--muted); text-align: center; padding: 20px 0; }
+
+    /* Right column: session stats */
+    .now-right {
+      flex: 1;
+      padding: 16px 0 16px 16px;
+      border-left: 1px solid var(--border);
+      display: flex; flex-direction: column; justify-content: space-between;
+    }
+    .session-header {
+      display: flex; justify-content: space-between; align-items: center;
+      margin-bottom: 10px;
+    }
+    .session-grid {
+      display: grid; grid-template-columns: 1fr 1fr;
+      gap: 10px; margin-bottom: 12px;
+    }
+    .stat-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 10px; padding: 10px 12px;
+    }
+    .stat-card .label { font-size: 11px; color: var(--muted); letter-spacing: 1px; margin-bottom: 4px; }
+    .stat-card .value { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .stat-card.cyan .value  { color: var(--cyan); }
+    .stat-card.green .value { color: var(--green); }
+    .stat-card.gold .value  { color: var(--gold); }
+    .stat-card.muted .value { color: var(--muted); }
+
+    .session-footer {
+      font-size: 12px; color: var(--muted);
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    #session-status { font-size: 12px; font-weight: 600; }
+    .reset-btn-small {
+      background: none; border: 1px solid var(--border); border-radius: 6px;
+      color: var(--muted); font-size: 11px; padding: 4px 10px; cursor: pointer;
+    }
+    .reset-btn-small:hover { border-color: var(--red); color: var(--red); }
+
+    /* ── Page: Charts ────────────────────────────────────────────────────────── */
+    .chart-page { display: none; flex-direction: column; padding: 10px 16px; }
+    .chart-page.active { display: flex; }
+    .chart-title {
+      font-size: 12px; font-weight: 700; letter-spacing: 2px; color: var(--muted);
+      margin-bottom: 8px;
+    }
+    .chart-wrap { flex: 1; position: relative; }
+    .chart-summary {
+      font-size: 12px; color: var(--muted); margin-top: 8px;
+      padding-top: 8px; border-top: 1px solid var(--border);
+    }
+    .summary-grid { display: flex; gap: 24px; }
+    .summary-item { display: flex; flex-direction: column; }
+    .summary-item .s-label { font-size: 10px; letter-spacing: 1px; color: var(--muted); margin-bottom: 2px; }
+    .summary-item .s-val   { font-size: 14px; font-weight: 600; }
+
+    /* ── Page: Settings ─────────────────────────────────────────────────────── */
+    #page-settings { display: none; flex-direction: row; gap: 20px; padding: 14px 20px; }
+    #page-settings.active { display: flex; }
+
+    .settings-col {
+      flex: 1; display: flex; flex-direction: column; gap: 10px;
+    }
+    .settings-col + .settings-col { border-left: 1px solid var(--border); padding-left: 20px; }
+
+    .settings-title { font-size: 11px; font-weight: 700; letter-spacing: 2px; color: var(--muted); }
+
+    .field-group { display: flex; flex-direction: column; gap: 4px; }
+    .field-group label { font-size: 12px; color: var(--muted); }
+    .field-group input, .field-group select {
+      background: var(--surface); border: 1px solid var(--border);
+      color: var(--text); border-radius: 8px; padding: 10px 12px;
+      font-size: 14px; outline: none; width: 100%;
+    }
+    .field-group input:focus, .field-group select:focus { border-color: var(--cyan); }
+    .field-group select option { background: var(--surface); }
+
+    .btn-primary {
+      background: var(--cyan); color: #000; font-weight: 700;
+      border: none; border-radius: 8px; padding: 11px;
+      font-size: 14px; cursor: pointer; width: 100%;
+    }
+    .btn-primary:disabled { opacity: .5; cursor: not-allowed; }
+    .btn-primary:not(:disabled):hover { filter: brightness(1.1); }
+
+    .btn-secondary {
+      background: var(--surface); border: 1px solid var(--border);
+      color: var(--text); border-radius: 8px; padding: 10px;
+      font-size: 13px; cursor: pointer; width: 100%;
+    }
+    .btn-secondary:hover { border-color: var(--cyan); color: var(--cyan); }
+
+    .btn-danger {
+      background: none; border: 1px solid var(--red);
+      color: var(--red); border-radius: 8px; padding: 9px;
+      font-size: 13px; cursor: pointer; width: 100%;
+    }
+
+    #login-status {
+      font-size: 12px; padding: 8px 10px; border-radius: 6px;
+      background: var(--surface); border: 1px solid var(--border);
+    }
+    .status-ok  { color: var(--green); }
+    .status-err { color: var(--red); }
+    .status-inf { color: var(--amber); }
+
+    .theme-buttons { display: flex; gap: 6px; }
+    .theme-btn {
+      flex: 1; padding: 8px 6px; font-size: 12px; border-radius: 6px;
+      background: var(--surface); border: 1px solid var(--border);
+      color: var(--text); cursor: pointer;
+    }
+    .theme-btn.active { border-color: var(--cyan); color: var(--cyan); font-weight: 700; }
+
+    .info-box {
+      font-size: 11px; color: var(--muted); padding: 8px;
+      background: var(--surface); border-radius: 6px; border: 1px solid var(--border);
+      line-height: 1.6;
+    }
+    .info-box strong { color: var(--cyan); }
+
+    /* ── Bottom nav ──────────────────────────────────────────────────────────── */
+    .nav-tab {
+      flex: 1; display: flex; flex-direction: column; align-items: center;
+      justify-content: center; gap: 2px; background: none; border: none;
+      color: var(--muted); cursor: pointer; padding: 6px 0;
+      transition: color .2s; border-top: 2px solid transparent;
+    }
+    .nav-tab.active { color: var(--cyan); border-top-color: var(--cyan); }
+    .nav-tab:hover:not(.active) { color: var(--text); }
+    .nav-icon { font-size: 18px; line-height: 1; }
+    .nav-label { font-size: 11px; font-weight: 600; letter-spacing: 0.5px; }
+
+    /* ── Loading overlay ─────────────────────────────────────────────────────── */
+    #loading-overlay {
+      position: fixed; top: 0; left: 0; width: 800px; height: 480px;
+      background: rgba(13,27,42,.85); display: none; z-index: 999;
+      align-items: center; justify-content: center; flex-direction: column; gap: 16px;
+    }
+    #loading-overlay.show { display: flex; }
+    .spinner {
+      width: 40px; height: 40px; border: 4px solid var(--border);
+      border-top-color: var(--cyan); border-radius: 50%;
+      animation: spin .8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .loading-msg { font-size: 14px; color: var(--muted); }
+  </style>
+</head>
+<body>
+
+<!-- ── Header ───────────────────────────────────────────────────────────────── -->
+<header id="header">
+  <div class="header-left">
+    <div class="pulse-dot"></div>
+    <span class="app-title">CLAUDE MONITOR</span>
+  </div>
+  <div class="header-right">
+    <span id="date"></span>
+    <span id="clock"></span>
+  </div>
+</header>
+
+<!-- ── Main ─────────────────────────────────────────────────────────────────── -->
+<main id="main">
+
+  <!-- NOW ------------------------------------------------------------------ -->
+  <div id="page-now" class="page">
+    <div class="now-left">
+      <div class="section-label">MESSAGGI RIMASTI</div>
+      <div id="remaining-num" class="big-number">—</div>
+      <div class="progress-row">
+        <div class="progress-bar"><div id="progress-fill" class="progress-fill"></div></div>
+        <span id="pct-badge" class="pct-badge">—</span>
+      </div>
+      <div class="account-meta">
+        <span id="progress-text">— / — messaggi</span>
+        <span id="countdown">—</span>
+      </div>
+    </div>
+    <div class="now-right">
+      <div>
+        <div class="session-header">
+          <span class="section-label">SESSIONE CORRENTE</span>
+        </div>
+        <div class="session-grid">
+          <div class="stat-card cyan">
+            <div class="label">INPUT</div>
+            <div id="tok-input" class="value">—</div>
+          </div>
+          <div class="stat-card green">
+            <div class="label">OUTPUT</div>
+            <div id="tok-output" class="value">—</div>
+          </div>
+          <div class="stat-card gold">
+            <div class="label">COSTO USD</div>
+            <div id="tok-cost" class="value">$—</div>
+          </div>
+          <div class="stat-card muted">
+            <div class="label">RICHIESTE</div>
+            <div id="tok-count" class="value">—</div>
+          </div>
+        </div>
+      </div>
+      <div class="session-footer">
+        <span id="session-status">—</span>
+        <span id="last-updated" style="color:var(--muted)">—</span>
+        <button class="reset-btn-small" onclick="resetSession()">Reset</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- HOURLY --------------------------------------------------------------- -->
+  <div id="page-hourly" class="page chart-page">
+    <div class="chart-title">UTILIZZO ULTIME 24 ORE</div>
+    <div class="chart-wrap"><canvas id="chart-hourly"></canvas></div>
+    <div class="chart-summary">
+      <div class="summary-grid">
+        <div class="summary-item"><span class="s-label">INPUT</span><span id="sum-h-input" class="s-val" style="color:var(--cyan)">—</span></div>
+        <div class="summary-item"><span class="s-label">OUTPUT</span><span id="sum-h-output" class="s-val" style="color:var(--green)">—</span></div>
+        <div class="summary-item"><span class="s-label">COSTO</span><span id="sum-h-cost" class="s-val" style="color:var(--gold)">—</span></div>
+        <div class="summary-item"><span class="s-label">AGGIORNATO</span><span id="sum-h-upd" class="s-val" style="color:var(--muted);font-size:12px">—</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- DAILY ---------------------------------------------------------------- -->
+  <div id="page-daily" class="page chart-page">
+    <div class="chart-title">UTILIZZO ULTIMI 7 GIORNI</div>
+    <div class="chart-wrap"><canvas id="chart-daily"></canvas></div>
+    <div class="chart-summary">
+      <div class="summary-grid">
+        <div class="summary-item"><span class="s-label">INPUT</span><span id="sum-d-input" class="s-val" style="color:var(--cyan)">—</span></div>
+        <div class="summary-item"><span class="s-label">OUTPUT</span><span id="sum-d-output" class="s-val" style="color:var(--green)">—</span></div>
+        <div class="summary-item"><span class="s-label">COSTO</span><span id="sum-d-cost" class="s-val" style="color:var(--gold)">—</span></div>
+        <div class="summary-item"><span class="s-label">GIORNI ATTIVI</span><span id="sum-d-days" class="s-val" style="color:var(--muted)">—</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- WEEKLY --------------------------------------------------------------- -->
+  <div id="page-weekly" class="page chart-page">
+    <div class="chart-title">UTILIZZO ULTIME 4 SETTIMANE</div>
+    <div class="chart-wrap"><canvas id="chart-weekly"></canvas></div>
+    <div class="chart-summary">
+      <div class="summary-grid">
+        <div class="summary-item"><span class="s-label">INPUT</span><span id="sum-w-input" class="s-val" style="color:var(--cyan)">—</span></div>
+        <div class="summary-item"><span class="s-label">OUTPUT</span><span id="sum-w-output" class="s-val" style="color:var(--green)">—</span></div>
+        <div class="summary-item"><span class="s-label">COSTO</span><span id="sum-w-cost" class="s-val" style="color:var(--gold)">—</span></div>
+        <div class="summary-item"><span class="s-label">SETTIMANE ATTIVE</span><span id="sum-w-weeks" class="s-val" style="color:var(--muted)">—</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SETTINGS ------------------------------------------------------------- -->
+  <div id="page-settings" class="page">
+    <div class="settings-col">
+      <div class="settings-title">ACCESSO CLAUDE.AI</div>
+      <div id="login-status" class="info-box"><span class="status-inf">○ Non connesso</span></div>
+      <div class="field-group">
+        <label>Email</label>
+        <input type="email" id="settings-email" placeholder="tua@email.com" autocomplete="email">
+      </div>
+      <div class="field-group">
+        <label>Password</label>
+        <input type="password" id="settings-password" placeholder="••••••••" autocomplete="current-password">
+      </div>
+      <button id="login-btn" class="btn-primary" onclick="doLogin()">Accedi a Claude.ai</button>
+      <button id="poll-btn" class="btn-secondary" onclick="forcePoll()">⟳ Aggiorna Adesso</button>
+      <button class="btn-danger" onclick="doLogout()">Disconnetti</button>
+    </div>
+
+    <div class="settings-col">
+      <div class="settings-title">PREFERENZE</div>
+      <div class="field-group">
+        <label>Intervallo aggiornamento</label>
+        <select id="poll-interval" onchange="savePollInterval()">
+          <option value="30">30 secondi</option>
+          <option value="60" selected>1 minuto</option>
+          <option value="120">2 minuti</option>
+          <option value="300">5 minuti</option>
+          <option value="600">10 minuti</option>
+        </select>
+      </div>
+      <div class="field-group">
+        <label>Tema</label>
+        <div class="theme-buttons">
+          <button class="theme-btn" data-theme="dark"   onclick="changeTheme('dark')">Scuro</button>
+          <button class="theme-btn" data-theme="blue"   onclick="changeTheme('blue')">Blu</button>
+          <button class="theme-btn" data-theme="purple" onclick="changeTheme('purple')">Viola</button>
+        </div>
+      </div>
+      <div class="info-box">
+        <strong>Accesso da PC o telefono:</strong><br>
+        Apri il browser e vai su<br>
+        <strong id="server-url">http://raspberrypi.local:8080</strong><br><br>
+        Il Tampermonkey può inviare dati qui:<br>
+        <strong id="api-url">http://raspberrypi.local:8080</strong>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<!-- ── Bottom nav ───────────────────────────────────────────────────────────── -->
+<nav id="nav">
+  <button class="nav-tab active" data-page="now" onclick="go('now')">
+    <span class="nav-icon">◉</span>
+    <span class="nav-label">ADESSO</span>
+  </button>
+  <button class="nav-tab" data-page="hourly" onclick="go('hourly')">
+    <span class="nav-icon">⏱</span>
+    <span class="nav-label">ORA</span>
+  </button>
+  <button class="nav-tab" data-page="daily" onclick="go('daily')">
+    <span class="nav-icon">▦</span>
+    <span class="nav-label">GIORNO</span>
+  </button>
+  <button class="nav-tab" data-page="weekly" onclick="go('weekly')">
+    <span class="nav-icon">▤</span>
+    <span class="nav-label">SETT.</span>
+  </button>
+  <button class="nav-tab" data-page="settings" onclick="go('settings')">
+    <span class="nav-icon">⚙</span>
+    <span class="nav-label">IMPOST.</span>
+  </button>
+</nav>
+
+<!-- ── Loading overlay ──────────────────────────────────────────────────────── -->
+<div id="loading-overlay">
+  <div class="spinner"></div>
+  <div id="loading-msg" class="loading-msg">Accesso in corso…</div>
+</div>
+
+<!-- Chart.js ---------------------------------------------------------------- -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+
+<script>
+'use strict';
+
+/* ── State ──────────────────────────────────────────────────────────────────── */
+let DATA = { account: {}, tokens: {}, hourly: [], daily: [], weekly: [], settings: {}, session: {} };
+let currentPage = 'now';
+let charts = {};
+let resetAtTs = null;   // seconds, updated by loadData()
+let refreshTimer = null;
+
+/* ── Clock ───────────────────────────────────────────────────────────────────── */
+(function startClock() {
+  const clkEl  = document.getElementById('clock');
+  const dateEl = document.getElementById('date');
+  function tick() {
+    const now = new Date();
+    clkEl.textContent  = now.toLocaleTimeString('it-IT');
+    dateEl.textContent = now.toLocaleDateString('it-IT', { weekday:'short', day:'numeric', month:'short' });
+    updateCountdown(now);
+  }
+  tick();
+  setInterval(tick, 1000);
+})();
+
+function updateCountdown(now) {
+  const el = document.getElementById('countdown');
+  if (!el || !resetAtTs) { if(el) el.textContent = '—'; return; }
+  const secs = resetAtTs - Math.floor(now.getTime() / 1000);
+  if (secs <= 0) { el.textContent = 'Reset imminente'; return; }
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = secs % 60;
+  el.textContent = h > 0
+    ? `Reset: ${h}h ${String(m).padStart(2,'0')}m`
+    : `Reset: ${m}m ${String(s).padStart(2,'0')}s`;
+}
+
+/* ── Data loading ────────────────────────────────────────────────────────────── */
+async function loadData() {
+  try {
+    const [account, tokens, hourly, daily, weekly, settings, session] = await Promise.all([
+      fetch('/api/account').then(r=>r.json()),
+      fetch('/api/tokens').then(r=>r.json()),
+      fetch('/api/tokens/hourly').then(r=>r.json()),
+      fetch('/api/tokens/daily').then(r=>r.json()),
+      fetch('/api/tokens/weekly').then(r=>r.json()),
+      fetch('/api/settings').then(r=>r.json()),
+      fetch('/api/session').then(r=>r.json()),
+    ]);
+    DATA = { account, tokens, hourly, daily, weekly, settings, session };
+    resetAtTs = account.reset_at_ts || null;
+    applyTheme(settings.theme || 'dark');
+    render();
+    scheduleRefresh(settings.poll_interval || 60);
+  } catch (e) {
+    console.error('loadData:', e);
+  }
+}
+
+function scheduleRefresh(intervalSecs) {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(loadData, Math.max(30, intervalSecs) * 1000);
+}
+
+/* ── Navigation ─────────────────────────────────────────────────────────────── */
+function go(page) {
+  currentPage = page;
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+  document.getElementById(`page-${page}`).classList.add('active');
+  document.querySelector(`.nav-tab[data-page="${page}"]`).classList.add('active');
+  render();
+}
+
+/* ── Render dispatcher ───────────────────────────────────────────────────────── */
+function render() {
+  switch (currentPage) {
+    case 'now':     renderNow();          break;
+    case 'hourly':  renderChart('hourly'); break;
+    case 'daily':   renderChart('daily');  break;
+    case 'weekly':  renderChart('weekly'); break;
+    case 'settings':renderSettings();     break;
+  }
+}
+
+/* ── Render: NOW ─────────────────────────────────────────────────────────────── */
+function renderNow() {
+  const acc = DATA.account || {};
+  const tok = DATA.tokens  || {};
+  const has = acc.has_data !== false && acc.messages_remaining != null;
+
+  const remaining = has ? acc.messages_remaining : null;
+  const limit     = has ? (acc.messages_limit || 200) : 200;
+  const pct       = remaining != null ? Math.round(remaining / limit * 100) : 0;
+  const color     = pct > 50 ? 'var(--green)' : pct > 25 ? 'var(--amber)' : 'var(--red)';
+
+  setText('remaining-num', remaining != null ? remaining : '—');
+  setStyle('remaining-num', 'color', remaining != null ? color : 'var(--muted)');
+  setStyle('progress-fill', 'width', `${pct}%`);
+  setStyle('progress-fill', 'background', color);
+  setText('pct-badge', has ? `${pct}%` : '—');
+  setText('progress-text', has ? `${remaining} / ${limit} messaggi` : 'Nessun dato — accedi nelle Impostazioni');
+
+  // Countdown updated by clock tick
+
+  // Session
+  setText('tok-input',  fmt(tok.total_input));
+  setText('tok-output', fmt(tok.total_output));
+  setText('tok-cost',   `$${(tok.cost_usd||0).toFixed(2)}`);
+  setText('tok-count',  tok.requests_count || 0);
+
+  // Status / last updated
+  const s = DATA.session || {};
+  const statusEl = document.getElementById('session-status');
+  if (s.logged_in) {
+    statusEl.textContent = '● Connesso';
+    statusEl.style.color = 'var(--green)';
+  } else {
+    statusEl.textContent = '○ Non connesso';
+    statusEl.style.color = 'var(--red)';
+  }
+
+  const lastTs = acc.ts;
+  setText('last-updated', lastTs
+    ? `Aggiornato ${new Date(lastTs).toLocaleTimeString('it-IT')}`
+    : 'Mai aggiornato');
+}
+
+/* ── Render: charts ──────────────────────────────────────────────────────────── */
+function renderChart(type) {
+  const data = DATA[type] || [];
+  const labels    = data.map(d => d.label);
+  const inputArr  = data.map(d => d.input);
+  const outputArr = data.map(d => d.output);
+
+  const canvasId = `chart-${type}`;
+  if (charts[type]) { charts[type].destroy(); delete charts[type]; }
+
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+
+  const ctx = canvas.getContext('2d');
+  charts[type] = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: 'Output',
+          data: outputArr,
+          backgroundColor: 'rgba(0,232,122,.65)',
+          borderColor:     'rgba(0,232,122,.9)',
+          borderWidth: 1,
+          stack: 'stack',
+        },
+        {
+          label: 'Input',
+          data: inputArr,
+          backgroundColor: 'rgba(0,200,255,.55)',
+          borderColor:     'rgba(0,200,255,.85)',
+          borderWidth: 1,
+          stack: 'stack',
+        },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      animation: { duration: 250 },
+      plugins: {
+        legend: { labels: { color: '#7A9CC0', font: { size: 12 }, boxWidth: 14 } },
+        tooltip: {
+          callbacks: { label: ctx => `${ctx.dataset.label}: ${fmt(ctx.raw)}` },
+        },
+      },
+      scales: {
+        x: {
+          stacked: true,
+          ticks: { color: '#7A9CC0', font: { size: 11 }, maxRotation: 0 },
+          grid:  { color: 'rgba(30,52,80,.6)' },
+        },
+        y: {
+          stacked: true,
+          ticks: {
+            color: '#7A9CC0', font: { size: 11 },
+            callback: v => fmt(v),
+          },
+          grid: { color: 'rgba(30,52,80,.6)' },
+        },
+      },
+    },
+  });
+
+  const pfx     = type === 'hourly' ? 'h' : type === 'daily' ? 'd' : 'w';
+  const totIn   = data.reduce((a,d) => a + d.input, 0);
+  const totOut  = data.reduce((a,d) => a + d.output, 0);
+  const totCost = data.reduce((a,d) => a + d.cost, 0);
+  setText(`sum-${pfx}-input`,  fmt(totIn));
+  setText(`sum-${pfx}-output`, fmt(totOut));
+  setText(`sum-${pfx}-cost`,   `$${totCost.toFixed(2)}`);
+
+  if (type === 'hourly') {
+    setText('sum-h-upd', DATA.tokens?.last_updated
+      ? new Date(DATA.tokens.last_updated).toLocaleTimeString('it-IT') : '—');
+  } else if (type === 'daily') {
+    setText('sum-d-days', data.filter(d => d.input + d.output > 0).length + ' / 7');
+  } else {
+    setText('sum-w-weeks', data.filter(d => d.input + d.output > 0).length + ' / 4');
+  }
+}
+
+/* ── Render: settings ────────────────────────────────────────────────────────── */
+function renderSettings() {
+  const s = DATA.session  || {};
+  const cfg = DATA.settings || {};
+
+  const statusEl = document.getElementById('login-status');
+  if (s.logged_in && s.session_status === 'ok') {
+    statusEl.innerHTML = `<span class="status-ok">● Connesso come ${s.email || 'utente'}</span>`;
+  } else if (s.session_status === 'expired') {
+    statusEl.innerHTML = '<span class="status-err">⚠ Sessione scaduta — accedi di nuovo</span>';
+  } else {
+    statusEl.innerHTML = '<span class="status-err">○ Non connesso — inserisci le credenziali</span>';
+  }
+
+  const emailEl = document.getElementById('settings-email');
+  if (!emailEl.value) emailEl.value = cfg.email || '';
+
+  const polEl = document.getElementById('poll-interval');
+  polEl.value = String(cfg.poll_interval || 60);
+
+  document.querySelectorAll('.theme-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.theme === (cfg.theme || 'dark'));
+  });
+
+  // Server URL hints
+  const host = window.location.hostname;
+  const port = window.location.port || '8080';
+  const base = `http://${host}:${port}`;
+  setText('server-url', base);
+  setText('api-url', base);
+}
+
+/* ── Actions ─────────────────────────────────────────────────────────────────── */
+async function doLogin() {
+  const email = document.getElementById('settings-email').value.trim();
+  const pwd   = document.getElementById('settings-password').value;
+  if (!email || !pwd) { alert('Inserisci email e password'); return; }
+
+  showLoading('Accesso in corso… (~30 secondi)');
+  try {
+    const res  = await fetch('/api/login', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ email, password: pwd }),
+    });
+    const data = await res.json();
+    document.getElementById('settings-password').value = '';
+    if (data.ok) {
+      document.getElementById('login-status').innerHTML =
+        `<span class="status-ok">● Accesso riuscito! Aggiorno dati…</span>`;
+      await loadData();
+    } else {
+      document.getElementById('login-status').innerHTML =
+        `<span class="status-err">● Fallito: ${data.message}</span>`;
+    }
+  } catch (e) {
+    document.getElementById('login-status').innerHTML =
+      `<span class="status-err">● Errore: ${e.message}</span>`;
+  } finally {
+    hideLoading();
+  }
+}
+
+async function doLogout() {
+  await fetch('/api/logout', { method: 'POST' });
+  await loadData();
+}
+
+async function forcePoll() {
+  const btn = document.getElementById('poll-btn');
+  btn.textContent = '⟳ Aggiornamento…'; btn.disabled = true;
+  try {
+    await fetch('/api/poll', { method: 'POST' });
+    await loadData();
+  } finally {
+    btn.textContent = '⟳ Aggiorna Adesso'; btn.disabled = false;
+  }
+}
+
+async function resetSession() {
+  if (!confirm('Cancellare i dati della sessione corrente?')) return;
+  await fetch('/api/tokens', { method: 'DELETE' });
+  await loadData();
+}
+
+async function savePollInterval() {
+  const v = parseInt(document.getElementById('poll-interval').value);
+  await fetch('/api/settings', {
+    method: 'PUT', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ poll_interval: v }),
+  });
+  scheduleRefresh(v);
+}
+
+async function changeTheme(theme) {
+  applyTheme(theme);
+  DATA.settings = { ...DATA.settings, theme };
+  renderSettings();
+  await fetch('/api/settings', {
+    method: 'PUT', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ theme }),
+  });
+}
+
+/* ── Theme ───────────────────────────────────────────────────────────────────── */
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+}
+
+/* ── Overlay ─────────────────────────────────────────────────────────────────── */
+function showLoading(msg) {
+  document.getElementById('loading-msg').textContent = msg || 'Caricamento…';
+  document.getElementById('loading-overlay').classList.add('show');
+}
+function hideLoading() {
+  document.getElementById('loading-overlay').classList.remove('show');
+}
+
+/* ── Utils ───────────────────────────────────────────────────────────────────── */
+function fmt(n) {
+  if (n == null || isNaN(n)) return '0';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return Math.round(n / 1e3) + 'K';
+  return String(n);
+}
+function setText(id, val) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = String(val);
+}
+function setStyle(id, prop, val) {
+  const el = document.getElementById(id);
+  if (el) el.style[prop] = val;
+}
+
+/* ── Boot ─────────────────────────────────────────────────────────────────────── */
+loadData();
+</script>
+</body>
+</html>
