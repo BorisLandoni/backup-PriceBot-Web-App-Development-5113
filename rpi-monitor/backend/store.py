@@ -72,7 +72,7 @@ def session_totals() -> dict:
         'total_cache_creation': total_cache_creation,
         'requests_count': len(history),
         'cost_usd': round(total_cost, 6),
-        'last_updated': datetime.datetime.utcfromtimestamp(last_ts / 1000).isoformat() + 'Z' if last_ts else None,
+        'last_updated': datetime.datetime.fromtimestamp(last_ts / 1000, datetime.timezone.utc).isoformat().replace('+00:00', 'Z') if last_ts else None,
     }
 
 
@@ -121,7 +121,7 @@ def get_hourly() -> list[dict]:
         end = now_ms - i * HOUR
         events = [e for e in history if start <= e['ts'] < end]
         agg = _aggregate(events)
-        label = str(datetime.datetime.utcfromtimestamp(start / 1000).hour).zfill(2)
+        label = str(datetime.datetime.fromtimestamp(start / 1000, datetime.timezone.utc).hour).zfill(2)
         result.append({'label': label, 'input': agg['input'], 'output': agg['output'],
                        'cost': round(agg['cost'], 6)})
     return result
@@ -136,7 +136,7 @@ def get_daily() -> list[dict]:
         end = now_ms - i * DAY
         events = [e for e in history if start <= e['ts'] < end]
         agg = _aggregate(events)
-        d = datetime.datetime.utcfromtimestamp(start / 1000)
+        d = datetime.datetime.fromtimestamp(start / 1000, datetime.timezone.utc)
         label = IT_DAYS[(d.weekday() + 1) % 7]
         result.append({'label': label, 'input': agg['input'], 'output': agg['output'],
                        'cost': round(agg['cost'], 6)})
@@ -152,8 +152,8 @@ def get_weekly() -> list[dict]:
         end = now_ms - i * WEEK
         events = [e for e in history if start <= e['ts'] < end]
         agg = _aggregate(events)
-        d = datetime.datetime.utcfromtimestamp(start / 1000)
-        jan1 = datetime.datetime(d.year, 1, 1)
+        d = datetime.datetime.fromtimestamp(start / 1000, datetime.timezone.utc)
+        jan1 = datetime.datetime(d.year, 1, 1, tzinfo=datetime.timezone.utc)
         week = int(((d - jan1).days + jan1.weekday() + 1) / 7) + 1
         result.append({'label': f'W{week}', 'input': agg['input'], 'output': agg['output'],
                        'cost': round(agg['cost'], 6)})
