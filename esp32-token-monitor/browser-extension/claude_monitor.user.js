@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude Monitor → ESP32  (token + limiti account)
 // @namespace    https://github.com/BorisLandoni/esp32-claude-token-monitor
-// @version      2.0.0
+// @version      2.1.0
 // @description  Legge automaticamente i token usati e i limiti account da claude.ai — nessuna installazione altrove
 // @author       Boris Landoni
 // @match        https://claude.ai/*
@@ -58,8 +58,8 @@
   }
 
   // ── Ricerca ricorsiva di dati di utilizzo in qualsiasi oggetto JSON ───────
-  // claude.ai non ha un endpoint documentato; questa funzione riconosce
-  // i campi relativi ai limiti indipendentemente dalla struttura esatta.
+  // Supporta sia il formato conteggio (messages_remaining/limit) sia il
+  // formato percentuale (session_pct_used) usato dagli account Pro claude.ai.
   function extractAccountLimits(obj, depth = 0) {
     if (!obj || typeof obj !== 'object' || depth > 8) return null;
     if (Array.isArray(obj)) {
@@ -73,8 +73,8 @@
     const keys = Object.keys(obj);
     const keyStr = keys.join(' ').toLowerCase();
 
-    // Riconosce oggetti che contengono dati di limite/utilizzo
-    const looksLikeLimit =
+    // Pattern A: conteggio messaggi (formato classico)
+    const looksCount =
       keyStr.includes('remaining') ||
       keyStr.includes('messages_left') ||
       (keyStr.includes('limit') && (keyStr.includes('used') || keyStr.includes('reset'))) ||
@@ -82,31 +82,67 @@
       keyStr.includes('quota') ||
       (keyStr.includes('usage') && keyStr.includes('reset'));
 
-    if (looksLikeLimit) {
+    // Pattern B: percentuale (account Pro — Settings > Utilizzo)
+    const PCT_KEYS = ['pct_used','percent_used','usage_fraction','used_fraction','used_pct','usage_pct'];
+    const looksPct = PCT_KEYS.some(p => keyStr.includes(p));
+
+    if (looksCount || looksPct) {
       const r = {};
       for (const [k, v] of Object.entries(obj)) {
         const kl = k.toLowerCase();
-        if (kl.includes('remaining') || kl.includes('left'))  r.messages_remaining = Number(v);
-        if ((kl.includes('limit') || kl.includes('max') || kl.includes('total')) && typeof v === 'number' && v > 0)
+
+        // Campi conteggio
+        if ((kl.includes('remaining') || kl.includes('left')) && v != null)
+          r.messages_remaining = Number(v);
+        if ((kl.includes('limit') || kl.includes('max') || kl.includes('total'))
+            && typeof v === 'number' && v > 0
+            && !kl.includes('pct') && !kl.includes('percent'))
           r.messages_limit = v;
-        if ((kl.includes('used') || kl.includes('consumed') || kl.includes('count')) && typeof v === 'number')
+        if ((kl.includes('used') || kl.includes('consumed') || kl.includes('count'))
+            && typeof v === 'number'
+            && !kl.includes('pct') && !kl.includes('percent'))
           r.messages_used = v;
+
+        // Campi percentuale (Pro accounts)
+        if (PCT_KEYS.some(p => kl.includes(p)) && v != null) {
+          const fv = parseFloat(v);
+          const pct = fv <= 1.0 ? Math.round(fv * 100) : Math.round(fv);
+          r.session_pct_used      = pct;
+          r.session_pct_remaining = 100 - pct;
+        }
+
         if (kl.includes('reset') && v) r.reset_at = v;
         if (kl.includes('plan') || kl.includes('tier')) r.plan = String(v);
       }
-      if (r.messages_remaining !== undefined || r.messages_limit !== undefined) {
-        // Ricostruisce used se mancante
+
+      const hasData = r.messages_remaining !== undefined
+                   || r.messages_limit !== undefined
+                   || r.session_pct_used !== undefined;
+      if (hasData) {
         if (r.messages_used === undefined && r.messages_limit && r.messages_remaining !== undefined)
           r.messages_used = r.messages_limit - r.messages_remaining;
         return r;
       }
     }
 
-    // Ricerca nei sottoggetti
-    for (const v of Object.values(obj)) {
+    // Ricerca ricorsiva nei sottoggetti
+    for (const [k, v] of Object.entries(obj)) {
       if (v && typeof v === 'object') {
         const found = extractAccountLimits(v, depth + 1);
-        if (found) return found;
+        if (found) {
+          // Propaga prefisso weekly se la chiave padre lo indica
+          const kl = k.toLowerCase();
+          if (kl.includes('weekly') || kl.includes('week')) {
+            const weekly = {};
+            for (const [fk, fv] of Object.entries(found)) {
+              const newKey = fk === 'reset_at' ? 'weekly_resets_at'
+                           : fk.startsWith('weekly_') ? fk : `weekly_${fk}`;
+              weekly[newKey] = fv;
+            }
+            return weekly;
+          }
+          return found;
+        }
       }
     }
     return null;

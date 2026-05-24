@@ -29,19 +29,33 @@ client = ClaudeClient()
 # ── Account limits processing ─────────────────────────────────────────────────
 
 def process_account_limits(limits: dict):
-    reset_at_ts = store.to_unix_ts(limits.get('reset_at'))
+    reset_at_ts = store.to_unix_ts(limits.get('reset_at') or limits.get('session_resets_at'))
     store.account = {
+        # Count-based (may be None for Pro accounts that only show %)
         'messages_remaining': limits.get('messages_remaining'),
         'messages_limit':     limits.get('messages_limit'),
         'messages_used':      limits.get('messages_used'),
-        'reset_at':           limits.get('reset_at'),
+        # Percentage-based (Pro accounts — from claude.ai/settings > Utilizzo)
+        'session_pct_used':      limits.get('session_pct_used'),
+        'session_pct_remaining': limits.get('session_pct_remaining'),
+        # Session reset
+        'reset_at':           limits.get('reset_at') or limits.get('session_resets_at'),
         'reset_at_ts':        reset_at_ts,
-        'plan':               limits.get('plan', 'pro'),
-        'session_status':     'ok',
-        'ts':                 int(time.time() * 1000),
+        'session_resets_at_ts': limits.get('session_resets_at_ts') or reset_at_ts,
+        # Weekly limits
+        'weekly_pct_used':      limits.get('weekly_pct_used'),
+        'weekly_pct_remaining': limits.get('weekly_pct_remaining'),
+        'weekly_resets_label':  limits.get('weekly_resets_label'),  # e.g. "sab 17:59"
+        'weekly_resets_at_ts':  store.to_unix_ts(limits.get('weekly_resets_at')),
+        # Meta
+        'plan':           limits.get('plan', 'pro'),
+        'session_status': 'ok',
+        'ts':             int(time.time() * 1000),
     }
     store.save()
-    print(f"[account] rimasti:{store.account['messages_remaining']}/{store.account['messages_limit']}")
+    spct = store.account.get('session_pct_used')
+    remain = store.account.get('messages_remaining')
+    print(f"[account] sessione:{spct}% usato | rimasti:{remain} | piano:{store.account['plan']}")
 
 
 # ── Background poll loop ──────────────────────────────────────────────────────

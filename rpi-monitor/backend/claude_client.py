@@ -1,14 +1,15 @@
 """
 Claude.ai client: Playwright-based login + lightweight httpx polling.
 
-First run:  login_playwright(email, password)  → saves cookies to cookies.json
-Subsequent: poll_limits()                       → uses saved cookies via httpx
-Fallback:   poll_with_playwright()              → loads full page if httpx fails
+First run:  login_playwright(email, password)  → saves cookies + discovers API endpoint
+Subsequent: poll_limits()                       → fast httpx poll with saved cookies
+Fallback:   poll_with_playwright()              → loads settings page if httpx fails
 """
 
 import asyncio
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Optional, Callable
@@ -21,16 +22,17 @@ try:
 except ImportError:
     HAS_PLAYWRIGHT = False
 
-COOKIES_FILE = Path(__file__).parent / 'cookies.json'
+COOKIES_FILE   = Path(__file__).parent / 'cookies.json'
 ENDPOINTS_FILE = Path(__file__).parent / 'endpoints.json'
-CHROMIUM_PATH = os.getenv('CHROMIUM_PATH', '')  # empty = use Playwright's bundled browser
+CHROMIUM_PATH  = os.getenv('CHROMIUM_PATH', '')
 
-# Candidate endpoints to try when polling (discovered dynamically during login)
+# Candidate endpoints tried when polling (best candidates first)
 CANDIDATE_URLS = [
     'https://claude.ai/api/organizations',
     'https://claude.ai/api/account',
     'https://claude.ai/api/me',
     'https://claude.ai/api/bootstrap',
+    'https://claude.ai/api/auth/session',
 ]
 
 _BROWSER_HEADERS = {
@@ -47,10 +49,15 @@ _BROWSER_HEADERS = {
 }
 
 
-# ── Limit data extractor (same logic as Tampermonkey userscript) ──────────────
+# ── Recursive extractor for any claude.ai JSON response ──────────────────────
 
 def extract_account_limits(obj, depth: int = 0) -> Optional[dict]:
-    """Recursively search any JSON object for claude.ai account limit fields."""
+    """
+    Recursively search JSON for claude.ai usage/limit data.
+    Handles both count-based (messages_remaining/limit) and
+    percentage-based (session_pct_used, weekly_pct_used) formats.
+    Returns None if nothing useful found.
+    """
     if not obj or not isinstance(obj, (dict, list)) or depth > 8:
         return None
 
@@ -63,7 +70,8 @@ def extract_account_limits(obj, depth: int = 0) -> Optional[dict]:
 
     keys_str = ' '.join(str(k) for k in obj.keys()).lower()
 
-    looks_like_limit = (
+    # Pattern A: count-based limits (messages remaining/limit)
+    looks_count = (
         'remaining' in keys_str or
         'messages_left' in keys_str or
         ('limit' in keys_str and ('used' in keys_str or 'reset' in keys_str)) or
@@ -72,36 +80,129 @@ def extract_account_limits(obj, depth: int = 0) -> Optional[dict]:
         ('usage' in keys_str and 'reset' in keys_str)
     )
 
-    if looks_like_limit:
+    # Pattern B: percentage-based usage (Pro accounts show %)
+    looks_pct = any(p in keys_str for p in (
+        'pct_used', 'percent_used', 'usage_fraction', 'used_fraction',
+        'used_pct', 'usage_pct', 'fraction_used',
+    ))
+
+    if looks_count or looks_pct:
         r: dict = {}
         for k, v in obj.items():
             kl = str(k).lower()
+
+            # Count-based fields
             if ('remaining' in kl or 'left' in kl) and v is not None:
-                try:
-                    r['messages_remaining'] = int(v)
-                except (TypeError, ValueError):
-                    pass
-            if ('limit' in kl or 'max' in kl or 'total' in kl) and isinstance(v, (int, float)) and v > 0:
+                try: r['messages_remaining'] = int(v)
+                except (TypeError, ValueError): pass
+
+            if (('limit' in kl or 'max' in kl or 'total' in kl)
+                    and isinstance(v, (int, float)) and v > 0
+                    and 'pct' not in kl and 'percent' not in kl):
                 r['messages_limit'] = int(v)
-            if ('used' in kl or 'consumed' in kl or 'count' in kl) and isinstance(v, (int, float)):
+
+            if (('used' in kl or 'consumed' in kl or 'count' in kl)
+                    and isinstance(v, (int, float))
+                    and 'pct' not in kl and 'percent' not in kl):
                 r['messages_used'] = int(v)
-            if 'reset' in kl and v:
+
+            # Percentage-based fields (Pro accounts)
+            if any(p in kl for p in ('pct_used', 'percent_used', 'usage_fraction',
+                                      'used_fraction', 'used_pct', 'usage_pct')):
+                if v is not None:
+                    try:
+                        fv = float(v)
+                        pct = int(round(fv * 100 if fv <= 1.0 else fv))
+                        r['session_pct_used'] = pct
+                        r['session_pct_remaining'] = 100 - pct
+                    except (TypeError, ValueError): pass
+
+            # Reset/expiry timestamps
+            if any(p in kl for p in ('reset', 'resets', 'expires', 'refresh')) and v:
                 r['reset_at'] = v
+
+            # Plan/tier
             if ('plan' in kl or 'tier' in kl) and v:
                 r['plan'] = str(v)
 
-        if 'messages_remaining' in r or 'messages_limit' in r:
-            if 'messages_used' not in r and 'messages_limit' in r and 'messages_remaining' in r:
+        has_data = any(k in r for k in (
+            'messages_remaining', 'messages_limit', 'session_pct_used'))
+        if has_data:
+            if ('messages_used' not in r and
+                    'messages_limit' in r and 'messages_remaining' in r):
                 r['messages_used'] = r['messages_limit'] - r['messages_remaining']
             return r
 
-    for v in obj.values():
-        if isinstance(v, (dict, list)):
-            found = extract_account_limits(v, depth + 1)
-            if found:
-                return found
+    # Recurse into nested objects — check for session/weekly containers
+    combined: dict = {}
+    for k, v in obj.items():
+        if not isinstance(v, (dict, list)):
+            continue
+        kl = str(k).lower()
+        inner = extract_account_limits(v, depth + 1)
+        if not inner:
+            continue
+        if 'session' in kl or 'current' in kl:
+            for ik, iv in inner.items():
+                if ik == 'reset_at':
+                    combined['session_resets_at'] = iv
+                elif not ik.startswith('session_'):
+                    combined[f'session_{ik}'] = iv
+                else:
+                    combined[ik] = iv
+        elif 'weekly' in kl or 'week' in kl:
+            for ik, iv in inner.items():
+                if ik == 'reset_at':
+                    combined['weekly_resets_at'] = iv
+                elif not ik.startswith('weekly_'):
+                    combined[f'weekly_{ik}'] = iv
+                else:
+                    combined[ik] = iv
+        else:
+            combined.update(inner)
+    return combined if combined else None
 
-    return None
+
+# ── DOM text scraper (fallback when API interception misses) ──────────────────
+
+async def _scrape_settings_dom(page) -> Optional[dict]:
+    """
+    Read usage percentages directly from the settings/utilizzo page text.
+    Handles Italian locale text like '77% utilizzato', 'Si ripristina tra 3 h 38 min'.
+    """
+    try:
+        content = await page.text_content('body') or ''
+        result: dict = {}
+
+        # Session: "XX% utilizzato" — first occurrence = session, second = weekly allmodels
+        pcts = re.findall(r'(\d+)%\s+utilizzato', content)
+        if pcts:
+            pct_used = int(pcts[0])
+            result['session_pct_used']       = pct_used
+            result['session_pct_remaining']  = 100 - pct_used
+        if len(pcts) >= 2:
+            wpct = int(pcts[1])
+            result['weekly_pct_used']        = wpct
+            result['weekly_pct_remaining']   = 100 - wpct
+
+        # Session reset: "Si ripristina tra X h Y min" or "Si ripristina tra Y min"
+        m = re.search(r'ripristina tra\s+(?:(\d+)\s*h\s+)?(\d+)\s*min', content)
+        if m:
+            hours = int(m.group(1)) if m.group(1) else 0
+            mins  = int(m.group(2))
+            result['session_resets_at_ts'] = int(time.time()) + hours * 3600 + mins * 60
+
+        # Weekly reset: "Si ripristina [day] HH:MM" e.g. "Si ripristina sab 17:59"
+        m2 = re.search(r'ripristina\s+(\w{3})\s+(\d{1,2}:\d{2})', content)
+        if m2:
+            result['weekly_resets_day']  = m2.group(1)   # e.g. "sab"
+            result['weekly_resets_time'] = m2.group(2)   # e.g. "17:59"
+            result['weekly_resets_label'] = f"{m2.group(1)} {m2.group(2)}"
+
+        return result if result else None
+    except Exception as e:
+        print(f'[dom-scrape] {e}')
+        return None
 
 
 # ── ClaudeClient ──────────────────────────────────────────────────────────────
@@ -140,20 +241,22 @@ class ClaudeClient:
         except Exception:
             return {}
 
-    # ── Playwright login ──────────────────────────────────────────────────────
+    def _make_playwright_launch_opts(self) -> dict:
+        opts: dict = {'headless': True}
+        if CHROMIUM_PATH:
+            opts['executable_path'] = CHROMIUM_PATH
+        return opts
+
+    # ── Login (one-time) ──────────────────────────────────────────────────────
 
     async def login_playwright(self, email: str, password: str) -> tuple[bool, str]:
-        """Log in to claude.ai using a headless browser. Saves cookies on success."""
+        """Log in to claude.ai. Saves cookies + discovers usage API endpoint."""
         if not HAS_PLAYWRIGHT:
-            return False, 'Playwright non è installato. Esegui: pip install playwright && playwright install chromium'
+            return False, 'Playwright non installato. Esegui: pip install playwright && playwright install chromium'
 
         try:
             async with async_playwright() as pw:
-                launch_opts: dict = {'headless': True}
-                if CHROMIUM_PATH:
-                    launch_opts['executable_path'] = CHROMIUM_PATH
-
-                browser = await pw.chromium.launch(**launch_opts)
+                browser = await pw.chromium.launch(**self._make_playwright_launch_opts())
                 ctx = await browser.new_context(
                     user_agent=_BROWSER_HEADERS['User-Agent'],
                     viewport={'width': 1280, 'height': 800},
@@ -181,62 +284,88 @@ class ClaudeClient:
 
                 page.on('response', handle_response)
 
-                # Navigate to login page
-                await page.goto('https://claude.ai/login', wait_until='domcontentloaded', timeout=30_000)
+                # Step 1: navigate to login
+                await page.goto('https://claude.ai/login',
+                                wait_until='domcontentloaded', timeout=30_000)
                 await page.wait_for_timeout(1500)
 
-                # Email step
+                # Step 2: fill email
                 try:
-                    email_sel = 'input[type="email"], input[name="email"], input[autocomplete="email"]'
-                    await page.locator(email_sel).first.fill(email)
-                    await page.keyboard.press('Tab')
-                    await page.wait_for_timeout(300)
-                    # Some login pages show password after clicking Continue
-                    submit_btn = page.locator('button[type="submit"]').first
-                    if await submit_btn.is_visible():
-                        await submit_btn.click()
-                    await page.wait_for_timeout(1500)
+                    sel = 'input[type="email"], input[name="email"], input[autocomplete="email"]'
+                    await page.locator(sel).first.fill(email)
+                    btn = page.locator('button[type="submit"]').first
+                    if await btn.is_visible():
+                        await btn.click()
+                    await page.wait_for_timeout(2000)
                 except Exception as e:
                     print(f'[login] email step: {e}')
 
-                # Password step
+                # Step 3: fill password
                 try:
                     await page.locator('input[type="password"]').first.fill(password)
                     await page.keyboard.press('Enter')
                 except Exception as e:
                     print(f'[login] password step: {e}')
 
-                # Wait for successful navigation
+                # Step 4: wait for redirect
                 try:
                     await page.wait_for_url('https://claude.ai/**', timeout=30_000)
                     await page.wait_for_load_state('networkidle', timeout=15_000)
                 except Exception:
                     pass
+                await page.wait_for_timeout(2000)
 
-                await page.wait_for_timeout(3000)
+                # Step 5: navigate to settings/utilizzo to get usage data
+                try:
+                    await page.goto('https://claude.ai/settings',
+                                    wait_until='domcontentloaded', timeout=20_000)
+                    await page.wait_for_timeout(1000)
+                    # Try clicking "Utilizzo" tab
+                    for sel in ('[role="tab"]:has-text("Utilizzo")',
+                                'button:has-text("Utilizzo")',
+                                'a:has-text("Utilizzo")'):
+                        try:
+                            el = page.locator(sel).first
+                            if await el.is_visible(timeout=2000):
+                                await el.click()
+                                await page.wait_for_timeout(1500)
+                                break
+                        except Exception:
+                            pass
+                    await page.wait_for_timeout(2000)
+                    # DOM scrape as supplement
+                    dom_data = await _scrape_settings_dom(page)
+                    if dom_data:
+                        found_limits.update(dom_data)
+                except Exception as e:
+                    print(f'[login] settings nav: {e}')
 
                 cookies = await ctx.cookies()
                 await browser.close()
 
                 if not cookies:
-                    return False, 'Accesso fallito: nessun cookie ottenuto. Controlla email e password.'
+                    return False, 'Accesso fallito: nessun cookie. Controlla email/password.'
 
                 COOKIES_FILE.write_text(json.dumps(cookies))
-                print(f'[login] salvati {len(cookies)} cookie')
+                print(f'[login] {len(cookies)} cookie salvati')
 
                 if found_url[0]:
                     self._save_endpoints(found_url[0])
-                    print(f'[login] endpoint limiti: {found_url[0]}')
+                    print(f'[login] endpoint: {found_url[0]}')
+
+                if found_limits:
+                    if self.on_limits_found:
+                        self.on_limits_found(found_limits)
 
                 return True, f'Accesso riuscito ({len(cookies)} cookie)'
 
         except Exception as e:
             return False, f'Errore accesso: {str(e)}'
 
-    # ── httpx poll (fast, lightweight) ───────────────────────────────────────
+    # ── Fast httpx poll ───────────────────────────────────────────────────────
 
     async def poll_limits(self) -> Optional[dict]:
-        """Try to get account limits via httpx with saved cookies. Fast path."""
+        """Poll claude.ai account limits via httpx with saved cookies. ~1s."""
         cookies = self._httpx_cookies()
         if not cookies:
             return None
@@ -268,35 +397,32 @@ class ClaudeClient:
                     if limits:
                         if url != self._discovered_url:
                             self._save_endpoints(url)
-                        print(f'[poll] limiti trovati via httpx: {url}')
+                        print(f'[poll] httpx OK: {url}')
                         return limits
                 except Exception as e:
-                    print(f'[poll] errore {url}: {e}')
+                    print(f'[poll] {url}: {e}')
 
         return None
 
-    # ── Playwright fallback poll (slow, reliable) ─────────────────────────────
+    # ── Playwright fallback poll ───────────────────────────────────────────────
 
     async def poll_with_playwright(self) -> Optional[dict]:
-        """Full page load to extract limits when httpx fails. Slower (~20s)."""
+        """Load settings page with Playwright to extract usage data. ~20-40s."""
         if not HAS_PLAYWRIGHT or not COOKIES_FILE.exists():
             return None
 
         try:
             async with async_playwright() as pw:
-                launch_opts: dict = {'headless': True}
-                if CHROMIUM_PATH:
-                    launch_opts['executable_path'] = CHROMIUM_PATH
+                browser = await pw.chromium.launch(**self._make_playwright_launch_opts())
+                ctx = await browser.new_context(
+                    user_agent=_BROWSER_HEADERS['User-Agent'])
 
-                browser = await pw.chromium.launch(**launch_opts)
-                ctx = await browser.new_context(user_agent=_BROWSER_HEADERS['User-Agent'])
-
-                saved_cookies = json.loads(COOKIES_FILE.read_text())
-                await ctx.add_cookies(saved_cookies)
+                saved = json.loads(COOKIES_FILE.read_text())
+                await ctx.add_cookies(saved)
 
                 page = await ctx.new_page()
                 found_limits: list = [None]
-                found_url: list = [None]
+                found_url:    list = [None]
 
                 async def handle_response(response):
                     if found_limits[0]:
@@ -317,11 +443,29 @@ class ClaudeClient:
 
                 page.on('response', handle_response)
 
-                try:
-                    await page.goto('https://claude.ai/', wait_until='networkidle', timeout=30_000)
-                    await page.wait_for_timeout(3000)
-                except Exception:
-                    pass
+                # Navigate directly to settings/utilizzo
+                await page.goto('https://claude.ai/settings',
+                                wait_until='domcontentloaded', timeout=30_000)
+                await page.wait_for_timeout(1500)
+                for sel in ('[role="tab"]:has-text("Utilizzo")',
+                            'button:has-text("Utilizzo")'):
+                    try:
+                        el = page.locator(sel).first
+                        if await el.is_visible(timeout=2000):
+                            await el.click()
+                            await page.wait_for_timeout(1500)
+                            break
+                    except Exception:
+                        pass
+                await page.wait_for_timeout(2500)
+
+                # DOM scrape
+                dom_data = await _scrape_settings_dom(page)
+
+                # Merge API + DOM data
+                combined = found_limits[0] or {}
+                if dom_data:
+                    combined = {**combined, **dom_data}
 
                 if found_url[0]:
                     self._save_endpoints(found_url[0])
@@ -332,8 +476,8 @@ class ClaudeClient:
                     COOKIES_FILE.write_text(json.dumps(new_cookies))
 
                 await browser.close()
-                return found_limits[0]
+                return combined if combined else None
 
         except Exception as e:
-            print(f'[pw-poll] errore: {e}')
+            print(f'[pw-poll] {e}')
             return None
